@@ -71,9 +71,9 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "based on the prompt. Place a clear title on the very first line."
         )
 
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=f"{system_instruction}\n\nPrompt: {user_prompt}",
+        response = client.models.generate_content(
+    model="gemini-1.5-flash",
+    contents=prompt_text,
         )
         
         doc_content = response.text
