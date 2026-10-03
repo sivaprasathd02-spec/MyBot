@@ -72,9 +72,9 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
         response = client.models.generate_content(
-    model="gemini-2.0-flash",
+    model="gemini-3.8-flash",
     contents=prompt_text,
-)
+        )
         
         doc_content = response.text
         lines = doc_content.strip().split('\n')
