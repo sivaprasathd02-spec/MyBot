@@ -10,6 +10,7 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
+from google.genai import errors as genai_errors
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -19,18 +20,26 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # "gemini-flash-latest" always points to the current Flash model, so it won't
-# expire like a hardcoded version. Override with GEMINI_MODEL if needed
-# (e.g. "gemini-3.5-flash").
+# expire like a hardcoded version. Override with GEMINI_MODEL if needed.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 
-# Optional allow-list. Either edit the list, or set ALLOWED_USER_IDS="123,456"
-# on Render. Leave empty to allow anyone (not recommended: strangers use your API quota).
+# Tried in order if the main model is overloaded (503) or unavailable (404).
+FALLBACK_MODELS = [
+    m.strip()
+    for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash,gemini-2.5-flash-lite").split(",")
+    if m.strip()
+]
+RETRY_CODES = {429, 500, 502, 503, 504}
+RETRY_DELAYS = [2, 5, 10]    # seconds to wait between retries on the same model
+
+# Optional allow-list. Edit the list, or set ALLOWED_USER_IDS="123,456" on Render.
+# Leave empty to allow anyone (not recommended: strangers use your API quota).
 ALLOWED_USER_IDS = [
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip().isdigit()
 ]
 
 COOLDOWN_SECONDS = 15        # minimum gap between requests per user
-GEMINI_TIMEOUT_SECONDS = 90  # give up if Gemini takes too long
+GEMINI_TIMEOUT_SECONDS = 90  # per-attempt timeout
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -101,6 +110,46 @@ def safe_filename(title: str) -> str:
     return f"{name or 'Generated_Document'}.pdf"
 
 
+# ---------- Gemini helper ----------
+async def generate_with_retry(prompt: str, status_msg=None) -> str:
+    """Calls Gemini with retries + model fallback to survive 503 'high demand' errors."""
+    models = [GEMINI_MODEL] + [m for m in FALLBACK_MODELS if m != GEMINI_MODEL]
+    last_error: Exception | None = None
+
+    for model in models:
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            try:
+                response = await asyncio.wait_for(
+                    gemini_client.aio.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config={"system_instruction": SYSTEM_INSTRUCTION},
+                    ),
+                    timeout=GEMINI_TIMEOUT_SECONDS,
+                )
+                return (response.text or "").strip()
+            except genai_errors.APIError as e:
+                last_error = e
+                code = getattr(e, "code", None)
+                if code in RETRY_CODES and attempt < len(RETRY_DELAYS):
+                    logger.warning("%s returned %s, retry %d", model, code, attempt + 1)
+                    if status_msg is not None:
+                        try:
+                            await status_msg.edit_text("⏳ Gemini is busy, retrying...")
+                        except Exception:
+                            pass  # e.g. "message not modified"
+                    await asyncio.sleep(RETRY_DELAYS[attempt])
+                    continue
+                logger.warning("%s failed with %s, trying next model", model, code)
+                break  # 404 / 400 / retries exhausted -> next model
+            except asyncio.TimeoutError as e:
+                last_error = e
+                logger.warning("%s timed out, trying next model", model)
+                break
+
+    raise last_error if last_error else RuntimeError("No Gemini model available")
+
+
 # ---------- Telegram handlers ----------
 def is_allowed(user_id: int) -> bool:
     return not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS
@@ -140,16 +189,7 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     status_msg = await update.message.reply_text("⏳ Generating document with Gemini...")
 
     try:
-        response = await asyncio.wait_for(
-            gemini_client.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=user_prompt,
-                config={"system_instruction": SYSTEM_INSTRUCTION},
-            ),
-            timeout=GEMINI_TIMEOUT_SECONDS,
-        )
-
-        doc_content = (response.text or "").strip()
+        doc_content = await generate_with_retry(user_prompt, status_msg)
         if not doc_content:
             await status_msg.edit_text("⚠️ Gemini returned an empty response. Try rephrasing your prompt.")
             return
@@ -170,9 +210,9 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         await status_msg.delete()
 
-    except asyncio.TimeoutError:
-        logger.error("Gemini request timed out")
-        await status_msg.edit_text("⚠️ Gemini took too long to respond. Please try again.")
+    except (asyncio.TimeoutError, genai_errors.ServerError):
+        logger.exception("Gemini unavailable after retries")
+        await status_msg.edit_text("⚠️ Gemini is overloaded right now. Please try again in a minute.")
     except Exception:
         logger.exception("Document generation failed")  # full traceback in Render logs
         await status_msg.edit_text("⚠️ Something went wrong generating the document. Please try again.")
@@ -188,7 +228,7 @@ def main():
         filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE, handle_prompt
     ))
 
-    logger.info("Bot started using model %s", GEMINI_MODEL)
+    logger.info("Bot started using model %s (fallbacks: %s)", GEMINI_MODEL, FALLBACK_MODELS)
     app.run_polling()
 
 
